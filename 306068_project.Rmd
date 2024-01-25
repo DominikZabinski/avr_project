@@ -1,0 +1,744 @@
+---
+title: "Flowing Insights"
+subtitle: "Navigating Poland's Water Consumption Landscape and Beyond"
+author: "Dominik Żabiński (306068)"
+output: 
+    beamer_presentation:
+        theme: "AnnArbor"
+        colortheme: "dolphin"
+        fonttheme: "structurebold"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+# libraries
+library(here)
+library(tidyverse)
+library(bdl)
+library(ggbump)
+library(ggtext)
+library(cowplot)
+library(sf)
+library(scales)
+```
+
+```{r, functions_data_manipulation}
+#' Derive JPT code from id to join BDL data to spatial data
+#'
+#' @param x character id of a region
+#' @param lvl numeric level of a region
+#'
+#' @return
+#' @export
+#'
+#' @examples
+derive_jpt_code <- function(x, lvl) {
+  if (lvl == 2) {
+    substr(x, 3, 4)
+  } else if (lvl == 5) {
+    paste0(derive_jpt_code(x, 2), substr(x, 8, 9))
+  } else {
+    paste0(derive_jpt_code(x, 5), substr(x, 10, 12))
+  }
+}
+
+#' Reading datasets into an environment
+#'
+#' @param dataset_list list
+#' @param path string
+#'
+#' @return
+#' @export
+#'
+#' @examples
+read_datasets <- function(dataset_list, path) {
+  for (i in names(dataset_list)) {
+    dataset_path <- sprintf("%s/%s.rds", path, i)
+    if (file.exists(dataset_path)) {
+      tmp_ <- readRDS(file = dataset_path)
+    } else {
+      tmp_ <- do.call(what = "get_data_by_variable", args = dataset_list[[i]])
+      saveRDS(object = tmp_, file = dataset_path)
+    }
+    
+    # change year for convenience
+    tmp_$year <- as.numeric(tmp_$year)
+    
+    # to easily join with shapefiles
+    if (dataset_list[[i]]$unitLevel > 0) {
+      tmp_$JPT_KOD_JE <- derive_jpt_code(x = tmp_$id, dataset_list[[i]]$unitLevel)
+    }
+
+    if (dataset_list[[i]]$varId == 396249) {
+      # data is in yearly in cubic meters, we want daily liters
+      tmp_ <- tmp_ %>% 
+        mutate(daily_l = 10 ^ 3 * val / 365)
+    }
+    
+    
+    assign(x = i, value = tmp_, envir = .GlobalEnv)
+  }
+}
+
+#' Reading .rds files with simplified shapefiles to an environment
+#'
+#' @param path 
+#'
+#' @return
+#' @export
+#'
+#' @examples
+read_simplified_shp <- function(path) {
+  for (i in list.files(path, full.names = T, pattern = "^shp")) {
+    assign(x = gsub(pattern = "\\.rds$", replacement = "", x = basename(i)), value = readRDS(file = i), envir = .GlobalEnv)
+  }
+}
+```
+
+```{r, functions_chart_related}
+#' Creating custom theme
+#'
+#' @return
+#' @export
+#'
+#' @examples
+this_proj_theme <- function() {
+  minimal <- theme_minimal()
+  minimal$panel.grid.major <- element_blank()
+  minimal$panel.grid.minor <- element_blank()
+  minimal$panel.grid.major.y <- element_line(colour = "grey90")
+  minimal
+}
+
+#' Creating ggdraw as a title for cowplot::plot_grid() call
+#'
+#' @param title_label character title
+#' @param size numeric font size of a title
+#'
+#' @return
+#' @export
+#'
+#' @examples
+cowplot_title <- function(title_label, size = 20) {
+  ggdraw() + 
+    draw_label(label = title_label, fontface = "bold", x = 0, hjust = 0, size = size) +
+    theme(plot.margin = margin(0, 0, 0, 7))  
+}
+
+#' Drawing rectangles as a bivariate legend
+#'
+#' @param data_ data.frame levels and colors to use
+#' @param row_name string column name for rows
+#' @param column_name string column name for columns
+#' @param fill_name string column name for fill
+#' @param lab_x string label for x-axis
+#' @param lab_y string label for y-axis
+#' @param title_size numerci font size for axis titles
+#'
+#' @return
+#' @export
+#'
+#' @examples
+draw_rect_legend <- function(data_, row_name = NULL, column_name = NULL, fill_name, lab_x = NULL, lab_y = NULL, title_size = 10) {
+  if (is.null(row_name)) {
+    data_$x <- 1
+    x_text <- element_blank()
+    x_labs <- 1
+  } else {
+    data_$x <- as.numeric(data_[[row_name]])
+    x_text <- theme_minimal()$axis.text.x
+    x_labs <- levels(data_[[row_name]])
+  }
+  
+  if (is.null(column_name)) {
+    data_$y <- 1
+    y_text <- element_blank()
+    y_labs <- 1
+  } else {
+    data_$y <- as.numeric(data_[[column_name]])
+    y_text <- theme_minimal()$axis.text.y
+    y_text$angle <- 90
+    y_text$hjust <- .5
+    y_labs <- levels(data_[[column_name]])
+  }
+  
+  data_ %>%
+    mutate(fill = .data[[fill_name]]) %>% 
+    ggplot() +
+    geom_tile(mapping = aes(x = x, y = y, fill = fill)) +
+    scale_fill_identity() +
+    scale_x_continuous(breaks = seq_along(x_labs), labels = x_labs) +
+    scale_y_continuous(breaks = seq_along(y_labs), labels = y_labs) +
+    labs(x = lab_x, y = lab_y) +
+    theme(axis.title = element_text(size = title_size), axis.title.y = element_text(angle = 90), 
+          axis.ticks = element_blank(), axis.line = element_blank(), panel.grid.major.y = element_blank(),
+          axis.text.x = x_text, axis.text.y = y_text) +
+    coord_fixed()
+}
+
+#' Combining map with bivariate legend
+#'
+#' @param that_map ggplot object with map
+#' @param that_legend ggplot object with legend
+#' @param legend_pos list positions of a legend
+#'
+#' @return
+#' @export
+#'
+#' @examples
+combine_map_legend <- function(that_map, that_legend, legend_pos = list(x = .05, y = .075, width = .3, height = .3)) {
+  ggdraw() +
+    draw_plot(that_map, x = 0, y = 0, width = 1, height = 1) +
+    draw_plot(that_legend, x = legend_pos$x, y = legend_pos$y, width = legend_pos$width, height = legend_pos$height)
+}
+
+#' Creating color pallette
+#'
+#' @param colors character hex codes of colors
+#' @param n numeric number of color in final pallette
+#'
+#' @return
+#' @export
+#'
+#' @examples
+cr_color_pal <- function(colors, n) {
+  colorRampPalette(colors = colors)(n)
+}
+
+#' Creating data.frame with coordinates of a square
+#'
+#' @param x0 numeric x starting point
+#' @param y0 numeric y starting point
+#' @param width numeric side
+#' @param id character id of a square
+#'
+#' @return
+#' @export
+#'
+#' @examples
+create_square <- function(x0, y0, width, id) { 
+  data.frame(x = c(x0, x0 + width, x0 + width, x0),
+             y = c(y0, y0, y0 + width, y0 + width),
+             id = id)
+}
+
+#' Creating data.frame with coordinates of squares
+#'
+#' @param data_ data.frame with data to use
+#' @param start_column string column name to use as starting point
+#' @param width_column string column name to use as width
+#'
+#' @return
+#' @export
+#'
+#' @examples
+create_squares <- function(data_, start_column, width_column) {
+  do.call(what = "rbind", 
+          args = lapply(X = 1:nrow(data_), 
+                        FUN = function(i) {
+                          starting_point <- data_[[start_column]][i]
+                          create_square(x0 = starting_point, 
+                                        y0 = starting_point, 
+                                        width = data_[[width_column]][i], id = i)
+                        }))
+}
+
+#' Create data.frame with population at specific levels of water consumption
+#'
+#' @param data_ data.frame data with consumption
+#' @param data_pop_ data.frame data with population
+#'
+#' @return
+#' @export
+#'
+#' @examples
+calc_pop_at_risk <- function(data_, data_pop_) {
+  data_pop_ %>% 
+    filter(year %in% years_to_compare) %>% 
+    select(JPT_KOD_JE, population = val, year) %>% 
+    left_join(y = data_ %>% select(JPT_KOD_JE, daily_l, year), by = c("JPT_KOD_JE", "year")) %>% 
+    mutate(daily_l_group = as.numeric(cut(daily_l, breaks = c(-Inf, 50, 100, Inf), include.lowest = TRUE)))  
+}
+
+#' Create list of data.frames with square coordinates
+#'
+#' @param data_ data.frame with data to use
+#'
+#' @return
+#' @export
+#'
+#' @examples
+calc_squares <- function(data_) {
+  list(squares_2002 = data_ %>% 
+         filter(year == 2002) %>% 
+         group_by(daily_l_group) %>%
+         summarise(population = sum(population)) %>% 
+         arrange(daily_l_group) %>% 
+         ungroup() %>% 
+         mutate(o = cumsum(population) - population),
+       squares_2022 = data_ %>% 
+         filter(year == 2022) %>% 
+         group_by(daily_l_group) %>%
+         summarise(population = sum(population)) %>% 
+         arrange(daily_l_group) %>% 
+         ungroup() %>% 
+         mutate(o = cumsum(population) - population))
+}
+```
+
+```{r, settings_data}
+# setting working directory
+setwd(here())
+
+# global variables
+path_to_store_data <- "data_bdl_download/"
+dir.create(path = path_to_store_data, recursive = TRUE, showWarnings = FALSE)
+# defining variables to download via {bdl}
+# 396249 - zużycie wody w gospodarstwach domowych ogółem na 1 mieszkańca
+# 72305 - Ludnosc wg grup wieku i plci - ogolem
+datasets <- list(national = list(varId = 396249, unitLevel = 0),
+                 voivodship = list(varId = 396249, unitLevel = 2),
+                 county = list(varId = 396249, unitLevel = 5),
+                 commune = list(varId = 396249, unitLevel = 6),
+                 pop_county = list(varId = 72305, unitLevel = 5),
+                 pop_commune = list(varId = 72305, unitLevel = 6))
+
+# setting the theme
+theme_set(this_proj_theme())
+
+# read datasets and simplified shapefiles into global environment
+read_datasets(dataset_list = datasets, path = path_to_store_data)
+read_simplified_shp(path = path_to_store_data)
+# to simplify shapefile:
+# download .zip file from https://gis-support.pl/baza-wiedzy-2/dane-do-pobrania/granice-administracyjne/ and unzip it
+# use {rmapshaper} to simplify it, for example:
+# rmapshaper::ms_simplify(input = sf::st_read(dsn = path_to_shp_file), keep = percentage_of_points_to_keep, keep_shapes = T)
+```
+
+# Agenda
+
+- Water consumption --- who cares?
+- High level of granulation data --- what to do with it?
+- Summary & used packages
+
+#
+
+```{r, who_statement}
+ggplot() + 
+  ggtext::geom_richtext(mapping = aes(x = c(-2, 2.5, 3.5), y = -1.5, label = "<img src='icons/water_drop.png'>"), fill = NA, label.color = NA) +
+  geom_text(aes(x = 0, y = 1, label = "For the most basic needs"), size = 15, color = "#509dc2", fontface = "bold") +
+  geom_text(aes(x = -3, y = -1.5, label = "5"), size = 40, color = "#376387") +
+  geom_text(aes(x = 0, y = -1.5, label = "-"), size = 40) +
+  geom_text(aes(x = 1.5, y = -1.5, label = "1"), size = 40, color = "#376387") +
+  geom_text(aes(x = 0, y = -3, label = "litres daily"), size = 8) +
+  coord_fixed(xlim = c(-5, 5), ylim = c(-3, 2)) +
+  theme_void() +
+  labs(caption = "Source: World Health Organization")
+```
+
+# 
+
+```{r, uk_data}
+uk_data <- list(washing_machine = 13,
+                dishes = 7,
+                shower = 36,
+                toilet = 31,
+                hot_tap = 10,
+                cold_tap = 31)
+dup_uk_data <- unlist(sapply(X = names(uk_data), 
+                             FUN = function(i) rep(i, round(uk_data[[i]] / 2)), 
+                             USE.NAMES = FALSE))
+df_ <- expand.grid(x = 1:13, y = 1:10)
+df_$cat <- c(dup_uk_data, rep(NA, nrow(df_) - length(dup_uk_data)))
+df_$lab <- sprintf("<img src='icons/%s.png'/>", df_$cat)
+df_labels <- df_ %>% filter(!is.na(cat)) %>% select(cat, lab) %>% unique
+labels <- paste0(df_labels$lab, 
+                 "<br>**", 
+                 str_to_title(gsub("_", " ", df_labels$cat)),
+                 "**<br>**(", unlist(uk_data), "l)**")
+names(labels) <- df_labels$cat
+
+plot_uk_data <- df_ %>% 
+  filter(!is.na(cat)) %>% 
+  ggplot(mapping = aes(x = x, y = y)) +
+  geom_tile(aes(fill = cat), color = "#FFFFFF", linewidth = 1.5) +
+  ggtext::geom_richtext(mapping = aes(label = lab),
+                        fill = NA, label.color = NA) +
+  scale_fill_discrete(name = NULL, labels = labels, type = c("#f3f3f3", "#509dc2", "#f3e6b3", "#b36600", "#f3b300", "#A2AEBB")) +
+  labs(caption = "Data: Energy Saving Trust. At Home with Water") +
+  theme_void() +
+  theme(legend.text = element_markdown(color = "black", size = 11),
+        legend.spacing.y = unit(.025, "npc")) +
+  guides(fill = guide_legend(byrow = TRUE))
+
+cowplot::plot_grid(cowplot_title(title_label = "How do we use water daily?"),
+                   cowplot_title(title_label = "if one uses 130 l; each box represents 2l", 10),
+                   plot_uk_data,
+                   rel_heights = c(0.1, 0.1, 1), ncol = 1)
+```
+
+#
+
+```{r, starting_national_line}
+annotations <- tibble(x = c(2003, 2010, 2018), 
+                      y = c(85, 80, 60), 
+                      label = c("Good...", "Still good...", "So what's next?"),
+                      size = 5)
+
+national_line <- national %>%
+  ggplot(mapping = aes(x = year, y = daily_l, group = 1)) +
+  geom_line(linewidth = 4, color = "#376387") +
+  geom_point(fill = "white", shape = 21, size = 8) +
+  labs(x = "Year", y = "Daily water consumption per capita [l]", caption = "Data source: Statistics Poland") +
+  geom_hline(yintercept = c(50, 100), color = "#d00000", linetype = "dashed", linewidth = 2) +
+  scale_x_continuous(breaks = seq(from = 2002, to = 2022, by = 4)) +
+  lapply(X = 1:nrow(annotations), 
+         FUN = function(i) do.call(what = "annotate", args = c(list(geom = "text"), as.list(annotations[i, ]))))
+
+cowplot::plot_grid(cowplot_title(title_label = "Daily water consumption in Poland"),
+                   cowplot_title(title_label = "2002 - 2022", 10),
+                   national_line,
+                   rel_heights = c(0.1, 0.05, 1), ncol = 1)
+```
+
+#
+
+```{r, how_polish_adm_system_works}
+bbox_14 <- sf::st_bbox(shp_voivodship %>% filter(JPT_KOD_JE == "14"))
+bbox_1416 <- sf::st_bbox(shp_county %>% filter(JPT_KOD_JE == "1416"))
+
+national_to_voiv <- ggplot() + 
+  geom_sf(data = shp_voivodship, fill = NA, color = "#00000033") + 
+  geom_sf(data = shp_voivodship %>% filter(JPT_KOD_JE == "14"), 
+          color = "#000000", fill = NA, linewidth = 4)
+
+voiv_to_county <- national_to_voiv +
+  geom_sf(data = shp_county, fill = NA, color = "#ffae0033") + 
+  geom_sf(data = shp_county %>% filter(JPT_KOD_JE == "1416"), 
+          color = "#ffae00", fill = NA, linewidth = 3)
+  
+county_to_commune <- voiv_to_county +
+  geom_sf(data = shp_commune, fill = NA, color = "#55856b8C") +
+  geom_sf(data = shp_commune %>% filter(substr(JPT_KOD_JE, 1, 4) == "1416"), 
+          color = "#55856b", fill = NA, linewidth = 1)
+
+plot_grid(national_to_voiv + theme_void(), 
+          cowplot_title("How Polish administrative\nsystem works?", size = 20), 
+          voiv_to_county + coord_sf(xlim = bbox_14[c("xmin", "xmax")], ylim = bbox_14[c("ymin", "ymax")]) + theme_void(),
+          county_to_commune + coord_sf(xlim = bbox_1416[c("xmin", "xmax")], ylim = bbox_1416[c("ymin", "ymax")]) + theme_void(),
+          nrow = 2, labels = c("voivodship", "", "county", "commune"))
+```
+
+#
+
+```{r, voiv_basic_line}
+change_voiv <- voivodship %>% 
+  left_join(y = filter(voivodship, year == 2002) %>% select(id, daily_l_0 = daily_l), by = "id") %>% 
+  mutate(change = daily_l / daily_l_0 - 1) 
+
+to_highlight <- list("062000000000" = list(title = "Podlaskie", title_color = "#509dc2", x = 2015, y = .21),
+                     "023200000000" = list(title = "West Pomeranian", title_color = "#f3b300", x = 2019, y = -.125),
+                     "052600000000" = list(title = "Holy Cross", title_color = "#000000", x = 2004, y = .2))
+
+plot_values <- voivodship %>% 
+  ggplot(mapping = aes(x = year, y = daily_l, group = id)) +
+  geom_line(color = "grey90") +
+  geom_hline(yintercept = c(50, 100), color = "#d00000", linetype = "dashed", linewidth = 2) +
+  geom_line(linetype = "dotted", data = national) +
+  geom_line(data = voivodship %>% filter(id %in% names(to_highlight)), mapping = aes(color = id), linewidth = 2) +
+  scale_color_manual(values = sapply(X = to_highlight, FUN = function(x) x$title_color)) +
+  theme(legend.position = "none") +
+  labs(y = "Daily water consumption per capita [l]", x = "Year", title = "... daily consumption?")
+
+plot_change <- ggplot(mapping = aes(x = year, y = change)) +
+  geom_line(data = change_voiv %>% filter(!id %in% names(to_highlight)), mapping = aes(group = id), color = "grey90") +
+  geom_line(data = change_voiv %>% filter(id %in% names(to_highlight)), mapping = aes(group = id, color = id), linewidth = 2) +
+  scale_color_manual(values = sapply(X = to_highlight, FUN = function(x) x$title_color)) +
+  scale_y_continuous(labels = scales::percent) +
+  lapply(X = to_highlight, 
+         FUN = function(i){
+           i$label <- sprintf("<span style='color:%s'>%s</span>", i$title_color, i$title)
+           suppressWarnings(do.call("annotate", args = c(list(geom = "richtext", fill = NA, label.color = NA, fontface = "bold"), i)))
+         }) + 
+  theme(legend.position = "none") +
+  labs(title = "... change in the last 20 years?", 
+       x = "Year", 
+       y = "Change since 2022",
+       caption = "Data source: Statistics Poland")
+
+cowplot::plot_grid(cowplot_title("How about voivodship regarding ..."), NULL,
+                   plot_values, plot_change,
+                   nrow = 2, 
+                   rel_heights = c(0.1, 1))
+```
+
+#
+
+```{r, county_basic_line}
+change_county <- county %>% 
+  left_join(y = filter(county, year == 2002) %>% select(id, daily_l_0 = daily_l), by = "id") %>% 
+  mutate(change = daily_l / daily_l_0 - 1) 
+
+plot_county_values <- county %>% 
+  ggplot(mapping = aes(x = year, y = daily_l)) +
+  geom_line(mapping = aes(group = id), color = "grey95") +
+  geom_hline(yintercept = c(50, 100), color = "#d00000", linetype = "dashed", linewidth = 2) +
+  labs(y = "Daily water consumption per capita [l]", x = "Year",
+       title = "Which counties are at risk?")
+
+plot_county_changes <- change_county %>% 
+  filter(is.finite(change)) %>% 
+  ggplot(mapping = aes(x = year, y = change)) +
+  geom_line(mapping = aes(group = id), color = "grey95") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Year", 
+       y = "Change since 2022",
+       caption = "Data source: Statistics Poland",
+       title = "Which counties experienced significant changes?")
+
+cowplot::plot_grid(cowplot_title("Counties - is this the best we can do?"), NULL,
+                   plot_county_values, plot_county_changes,
+                   nrow = 2, 
+                   rel_heights = c(0.1, 1))
+```
+
+#
+
+```{r, county_map_side_by_side}
+labels_daily <- c("<50", "50-100", "100+")
+labels_change <- c("-10%\nor less", "+/-\n10%", "10%\nor more")
+
+county_map_data <- county %>% 
+  filter(year == 2022) %>% 
+  select(id, daily_l, JPT_KOD_JE) %>% 
+  left_join(county %>% filter(year == 2002) %>% select(id, daily_0 = daily_l), 
+            by = "id") %>%
+  mutate(
+    change = daily_l / daily_0 - 1,
+    daily_l_group = cut(daily_l, breaks = c(-Inf, 50, 100, Inf), include.lowest = TRUE, labels = labels_daily, ordered_result = T),
+    change_group = cut(change, breaks = c(-Inf, -.15, .15, Inf), include.lowest = TRUE, labels = labels_change, ordered_result = T)
+  )
+
+# define colors
+bottom_color <- "#f3f3f3"
+top_daily_color <- "#509dc2"
+top_change_color <- "#f3b300"
+
+number_of_bins <- 3
+
+color_scale_daily_l <- data.frame(daily_l_group = factor(labels_daily, levels = labels_daily, ordered = T),
+                                  daily_fill = cr_color_pal(colors = c(bottom_color, top_daily_color), number_of_bins))
+color_scale_change <- data.frame(change_group = factor(labels_change, levels = labels_change, ordered = T),
+                                 change_fill = cr_color_pal(colors = c(bottom_color, top_change_color), number_of_bins))
+
+county_map_data <- county_map_data %>% 
+  left_join(y = color_scale_daily_l, by = "daily_l_group") %>% 
+  left_join(y = color_scale_change, by = "change_group")
+
+county_map_2022 <- shp_county %>% 
+  merge(y = county_map_data, by = "JPT_KOD_JE") %>% 
+  ggplot() +
+  geom_sf(mapping = aes(fill = daily_fill), size = 0.1, color = "grey95") +
+  theme_void() +
+  scale_fill_identity() +
+  labs(title = "... daily consumption")
+
+county_map_change <- shp_county %>% 
+  merge(y = county_map_data, by = "JPT_KOD_JE") %>% 
+  ggplot() +
+  geom_sf(mapping = aes(fill = change_fill), size = 0.1, color = "grey95") +
+  theme_void() +
+  scale_fill_identity() +
+  labs(title = "... change from 2002")
+
+legend_daily <- draw_rect_legend(data_ = color_scale_daily_l, row_name = "daily_l_group", fill_name = "daily_fill", lab_x = "Daily consumption")
+
+legend_change <- draw_rect_legend(data_ = color_scale_change, row_name = "change_group", fill_name = "change_fill", lab_x = "Change since 2002")
+
+cowplot::plot_grid(cowplot_title("Map to the rescue!"), NULL,
+                   cowplot_title("County level ...", size = 10), NULL,
+                   combine_map_legend(county_map_2022, legend_daily, legend_pos = list(x = 0, y = 0, width = 0.3, height = 0.3)), 
+                   combine_map_legend(county_map_change, legend_change, legend_pos = list(x = 0, y = 0, width = 0.3, height = 0.3)),
+                   nrow = 3,
+                   rel_heights = c(0.1, 0.05, 1))
+```
+
+# 
+
+```{r, explain_legend}
+top_color <- "#000000"
+top_colors <- cr_color_pal(colors = c(top_daily_color, top_color), number_of_bins)
+colors_all <- lapply(X = 1:number_of_bins, FUN = function(i) {
+  cr_color_pal(colors = c(color_scale_change$change_fill[i], top_colors[i]), number_of_bins)
+}) %>% unlist()
+
+color_scale_combined <- data.frame(daily_l_group = rep(color_scale_daily_l$daily_l_group, times = number_of_bins), 
+                                   change_group = rep(color_scale_change$change_group, each = number_of_bins),
+                                   fill = colors_all)
+color_scale_combined <- color_scale_combined %>% 
+  mutate(group = paste(daily_l_group, "AND", change_group))
+
+legend_combined <- draw_rect_legend(data_ = color_scale_combined, row_name = "change_group", column_name = "daily_l_group", fill_name = "fill", lab_x = "Change since 2002", lab_y = "Daily consumption")
+
+legend_daily_flip <- draw_rect_legend(data_ = color_scale_daily_l, column_name = "daily_l_group", fill_name = "daily_fill", lab_y = "Daily consumption")
+
+cowplot::plot_grid(nrow = 2,
+                   cowplot_title("Why not both?"), NULL, NULL,
+                   legend_daily_flip + labs(title = "Combine daily legend ..."),
+                   legend_change + labs(title = ".. with change since 2002 ..."),
+                   legend_combined + labs(title = "... and get combined view"), 
+                   rel_widths = c(1, 2, 2), rel_heights = c(0.1, 1))
+```
+
+#
+
+```{r, county_map_combined}
+county_map_data <- county_map_data %>% 
+   mutate(group = paste(daily_l_group, "AND", change_group))
+
+county_map_combined <- shp_county %>% 
+  left_join(county_map_data, by = "JPT_KOD_JE") %>% 
+  left_join(color_scale_combined, by = "group") %>% 
+  ggplot() +
+  geom_sf(mapping = aes(fill = fill), size = 0.1, color = "grey95") +
+  scale_fill_identity() + 
+  theme_void()
+
+cowplot::plot_grid(cowplot_title("One map to rule them all"),
+                   combine_map_legend(county_map_combined, legend_combined, legend_pos = list(x = 0, y = 0, width = 0.325, height = 0.325)),
+                   nrow = 2, 
+                   rel_heights = c(0.1, 1))
+```
+
+#
+
+```{r, commune_map_one_prov}
+commune_map_data <- commune %>% 
+  filter(year == 2022) %>% select(id, daily_l, JPT_KOD_JE) %>% 
+  left_join(commune %>% filter(year == 2002) %>% 
+              select(id, daily_0 = daily_l), by = "id") %>% 
+  mutate(
+    change = daily_l / daily_0 - 1,
+    daily_l_group = cut(daily_l, breaks = c(-Inf, 50, 100, Inf), include.lowest = TRUE, labels = labels_daily, ordered_result = T),
+    change_group = cut(change, breaks = c(-Inf, -.15, .15, Inf), include.lowest = TRUE, labels = labels_change, ordered_result = T),
+    group = paste(daily_l_group, "AND", change_group)
+  )
+
+selected_void_shp <- shp_commune %>% 
+  filter(substr(JPT_KOD_JE, 1, 2) == "28")
+
+map_this_sec <- selected_void_shp %>% 
+  left_join(commune_map_data, by = "JPT_KOD_JE") %>% 
+  left_join(color_scale_combined, by = "group") %>% 
+  ggplot() +
+  geom_sf(data = shp_commune, fill = NA, size = 0.1/2, color = "grey90") +
+  geom_sf(mapping = aes(fill = fill), size = 0.1/2, color = "grey95") +
+  scale_fill_identity() + 
+  theme_void() +
+  coord_sf(xlim = sf::st_bbox(selected_void_shp)[c("xmin", "xmax")], ylim = sf::st_bbox(selected_void_shp)[c("ymin", "ymax")])
+
+cowplot::plot_grid(cowplot_title("Communes combined"),
+                   cowplot_title(title_label = "Communes in Warmia–Masuria Province", 10),
+                   combine_map_legend(map_this_sec, legend_combined, legend_pos = list(x = .65, y = 0, width = 0.35, height = 0.35)),
+                   ncol = 1,
+                   rel_heights = c(0.1, 0.1, 1))
+```
+
+#
+
+```{r, population_at_risk_county}
+years_to_compare <- c(2002, 2022)
+square_pal <- cr_color_pal(c(bottom_color, top_daily_color), number_of_bins)
+names(square_pal) <- 1:3
+
+pop_at_risk_county <- calc_pop_at_risk(data_ = county, data_pop_ = pop_county)
+squares_county <- calc_squares(pop_at_risk_county)
+
+squares_2002_plot_county <- create_squares(squares_county$squares_2002, "o", "population") %>% 
+  ggplot(mapping = aes(x = x, y = y, group = id, fill = as.character(id))) + 
+  geom_polygon() +
+  geom_text(data = . %>% group_by(id) %>% summarise(label = scales::number((max(x) - min(x)) / 1e6, accuracy = .1), x = mean(x), y = mean(x)), mapping = aes(label = label), size = 6) +
+  scale_fill_manual(values = square_pal) +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "none", title = element_text(size = 16)) +
+  labs(title = sprintf("from %s in 2002 ... ", scales::number(squares_county$squares_2002 %>% filter(daily_l_group == 1) %>% .$population)))
+
+squares_2022_plot_county <- create_squares(squares_county$squares_2022, "o", "population") %>% 
+  ggplot(mapping = aes(x = x, y = y, group = id, fill = as.character(id))) + 
+  geom_polygon() +
+  geom_text(data = . %>% group_by(id) %>% summarise(label = scales::number((max(x) - min(x)) / 1e6, accuracy = .1), x = mean(x), y = mean(x)), mapping = aes(label = label), size = 6) +
+  scale_fill_manual(values = square_pal) +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "none", title = element_text(size = 16)) +
+  labs(title = sprintf("... to %s in 2022", scales::number(squares_county$squares_2022 %>% filter(daily_l_group == 1) %>% .$population)))
+
+cowplot::plot_grid(cowplot_title("At county level number of people at risk dropped ..."), NULL,
+                   squares_2002_plot_county, squares_2022_plot_county, 
+                   nrow = 2,
+                   rel_heights = c(0.1, 1))
+```
+
+#
+
+```{r, population_at_risk_commune}
+pop_at_risk_commune <- calc_pop_at_risk(data_ = commune, data_pop_ = pop_commune %>% filter(substr(JPT_KOD_JE, 7, 7) %in% c(1, 2, 3)))
+squares_commune <- calc_squares(pop_at_risk_commune)
+
+squares_2002_plot_commune <- create_squares(squares_commune$squares_2002, "o", "population") %>% 
+  ggplot(mapping = aes(x = x, y = y, group = id, fill = as.character(id))) + 
+  geom_polygon() +
+  geom_text(data = . %>% group_by(id) %>% summarise(label = scales::number((max(x) - min(x)) / 1e6, accuracy = .1), x = mean(x), y = mean(x)), mapping = aes(label = label), size = 6) +
+  scale_fill_manual(values = square_pal) +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "none", title = element_text(size = 16)) +
+  labs(title = sprintf("from %s in 2002 ... ", scales::number(squares_commune$squares_2002 %>% filter(daily_l_group == 1) %>% .$population)))
+
+squares_2022_plot_commune <- create_squares(squares_commune$squares_2022, "o", "population") %>% 
+  ggplot(mapping = aes(x = x, y = y, group = id, fill = as.character(id))) + 
+  geom_polygon() +
+  geom_text(data = . %>% group_by(id) %>% summarise(label = scales::number((max(x) - min(x)) / 1e6, accuracy = .1), x = mean(x), y = mean(x)), mapping = aes(label = label), size = 6) +
+  scale_fill_manual(values = square_pal) +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "none", title = element_text(size = 16)) +
+  labs(title = sprintf("... to %s in 2022", scales::number(squares_commune$squares_2022 %>% filter(daily_l_group == 1) %>% .$population)))
+
+cowplot::plot_grid(cowplot_title("At commune level number of people at risk dropped ..."), NULL,
+                   squares_2002_plot_commune, squares_2022_plot_commune, 
+                   nrow = 2,
+                   rel_heights = c(0.1, 1))
+```
+
+# Summary & packages
+
+:::::::::::::: {.columns}
+::: {.column}
+Summary
+
+- drill down
+- go spatial
+- use weights
+:::
+::: {.column}
+Packages
+
+- {tidyverse}
+- {bdl}
+- {ggbump}
+- {ggtext}
+- {cowplot}
+- {sf}
+- {rmapshaper}
+- {scales}
+:::
+::::::::::::::
+
+
+# 
+
+\huge
+Thank you for the attention
+
